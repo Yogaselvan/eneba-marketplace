@@ -1,0 +1,16 @@
+# Render Blueprint: free web service for the Go API. Create a free Postgres on Neon
+# (or Render) and paste its connection string as DATABASE_URL.
+services:
+  - type: web
+    name: marketplace-api
+    runtime: docker
+    rootDir: backend
+    plan: free
+    healthCheckPath: /healthz
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: CORS_ORIGINS
+        sync: false   # e.g. https://your-app.vercel.app
