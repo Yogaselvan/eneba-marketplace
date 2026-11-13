@@ -9,6 +9,8 @@ import (
 	mrand "math/rand"
 	"regexp"
 	"strings"
+
+	"github.com/jackc/pgx/v5"
 )
 
 func randomRef() string {
@@ -235,23 +237,23 @@ func (a *App) seed(ctx context.Context, force bool) error {
 		}
 	}
 
-	sellerIDs := []int64{}
-	for _, s := range sellerNames {
-		var id int64
+	// Rows are built in memory with explicit ids and bulk-loaded with COPY: ~9k key rows
+	// would otherwise cost one network round trip each against a remote database.
+	var sellerRows, productRows, offerRows, keyRows [][]any
+	for i, s := range sellerNames {
 		rating := 4.0 + rng.Float64()*0.99
-		if err := tx.QueryRow(ctx, `INSERT INTO sellers(name,rating,sales_count) VALUES($1,$2,$3) RETURNING id`, s, fmt.Sprintf("%.2f", rating), 500+rng.Intn(60000)).Scan(&id); err != nil {
-			return err
-		}
-		sellerIDs = append(sellerIDs, id)
+		sellerRows = append(sellerRows, []any{int64(i + 1), s, fmt.Sprintf("%.2f", rating), 500 + rng.Intn(60000)})
 	}
+	sellerCount := len(sellerNames)
 
 	pf := map[string]float64{}
 	for _, p := range platforms {
 		pf[p.name] = p.factor
 	}
 
+	var pid, oid, kid int64
 	for gi, g := range games {
-		// older games sell more units in aggregate; the first entries get a popularity boost
+		// older entries in the list get a popularity boost
 		popularity := 20000 - gi*120 + rng.Intn(4000)
 		for _, plat := range platformsFor(g, rng) {
 			region := regions[rng.Intn(len(regions))]
@@ -263,34 +265,46 @@ func (a *App) seed(ctx context.Context, force bool) error {
 				list = 300
 			}
 			list = list/100*100 + 99 // 59.99 style prices
-			slug := slugify(g.name + " " + plat + " " + region)
-			var pid int64
-			if err := tx.QueryRow(ctx, `INSERT INTO products(slug,name,platform,region,genre,description,list_price_cents,release_year,sales)
-				VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
-				slug, g.name, plat, region, g.genre, g.desc, list, g.year, popularity/(1+rng.Intn(3))+rng.Intn(500)).Scan(&pid); err != nil {
-				return err
-			}
-			// 2–6 sellers compete, always under the list price (that is the marketplace's selling point)
-			perm := rng.Perm(len(sellerIDs))
+			pid++
+			productRows = append(productRows, []any{pid, slugify(g.name + " " + plat + " " + region), g.name, plat, region, g.genre, g.desc, list, g.year, popularity/(1+rng.Intn(3)) + rng.Intn(500)})
+			// 2-6 sellers compete, always under the list price (the marketplace's selling point)
 			offerCount := 2 + rng.Intn(5)
-			for _, idx := range perm[:offerCount] {
-				discount := 0.08 + rng.Float64()*0.55
-				price := int(float64(list) * (1 - discount))
+			for _, idx := range rng.Perm(sellerCount)[:offerCount] {
+				price := int(float64(list) * (1 - (0.08 + rng.Float64()*0.55)))
 				price = price/10*10 + 9
 				if price < 99 {
 					price = 99
 				}
 				stock := 3 + rng.Intn(10)
-				var oid int64
-				if err := tx.QueryRow(ctx, `INSERT INTO offers(product_id,seller_id,price_cents,stock) VALUES($1,$2,$3,$4) RETURNING id`, pid, sellerIDs[idx], price, stock).Scan(&oid); err != nil {
-					return err
-				}
+				oid++
+				offerRows = append(offerRows, []any{oid, pid, int64(idx + 1), price, stock})
 				for k := 0; k < stock; k++ {
-					if _, err := tx.Exec(ctx, `INSERT INTO keys(offer_id,code) VALUES($1,$2)`, oid, newKey()); err != nil {
-						return err
-					}
+					kid++
+					keyRows = append(keyRows, []any{kid, oid, newKey()})
 				}
 			}
+		}
+	}
+	copyRows := func(table string, cols []string, rows [][]any) error {
+		_, err := tx.CopyFrom(ctx, pgx.Identifier{table}, cols, pgx.CopyFromRows(rows))
+		return err
+	}
+	if err := copyRows("sellers", []string{"id", "name", "rating", "sales_count"}, sellerRows); err != nil {
+		return err
+	}
+	if err := copyRows("products", []string{"id", "slug", "name", "platform", "region", "genre", "description", "list_price_cents", "release_year", "sales"}, productRows); err != nil {
+		return err
+	}
+	if err := copyRows("offers", []string{"id", "product_id", "seller_id", "price_cents", "stock"}, offerRows); err != nil {
+		return err
+	}
+	if err := copyRows("keys", []string{"id", "offer_id", "code"}, keyRows); err != nil {
+		return err
+	}
+	// explicit ids bypass the sequences, so move them past the loaded rows
+	for _, t := range []string{"sellers", "products", "offers", "keys"} {
+		if _, err := tx.Exec(ctx, fmt.Sprintf(`SELECT setval(pg_get_serial_sequence('%s','id'), (SELECT max(id) FROM %s))`, t, t)); err != nil {
+			return err
 		}
 	}
 
